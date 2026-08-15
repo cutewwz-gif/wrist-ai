@@ -1,0 +1,17 @@
+[Unit]
+Description=Wrist AI AutoDL chat proxy
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/wristai
+ExecStart=/wristai/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 18766 --proxy-headers --workers 1 --limit-concurrency 16
+Restart=always
+RestartSec=3
+User=root
+Environment=PYTHONUNBUFFERED=1
+# Set a strong password before deploying:
+Environment="WRISTAI_PASSWORD=CHANGE_ME"
+
+[Install]
+WantedBy=multi-user.target

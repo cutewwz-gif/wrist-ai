@@ -1,0 +1,31 @@
+# Android
+watch-app/local.properties
+watch-app/.gradle/
+watch-app/**/build/
+*.apk
+*.ap_
+*.aab
+*.dex
+*.class
+
+# Python
+**/__pycache__/
+**/.venv/
+*.py[cod]
+.Python
+
+# Server runtime secrets / data (keep on server only)
+server/data/
+*.env
+.env.*
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+*.log
+
+# Local scripts with secrets (if any)
+secrets/

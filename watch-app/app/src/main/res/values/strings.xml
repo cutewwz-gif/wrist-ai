@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">腕上AI</string>
+    <string name="settings">设置</string>
+    <string name="hint_input">说点什么…</string>
+    <string name="send">发送</string>
+    <string name="server_url">服务器地址</string>
+    <string name="device_key">设备密钥</string>
+    <string name="save">保存</string>
+    <string name="need_key">请先在设置里填写设备密钥</string>
+    <string name="thinking">思考中…</string>
+    <string name="empty_reply">(空回复)</string>
+    <string name="default_server">http://antony.fan/wristai</string>
+</resources>
