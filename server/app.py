@@ -19,24 +19,205 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from starlette.middleware.base import BaseHTTPMiddleware
 
 
+# Always merged into upstream system messages. Console textarea edits cannot remove it.
+NO_MARKDOWN_RULE = (
+    "输出必须是纯文本。严禁使用 Markdown 或任何排版标记，包括但不限于："
+    "星号加粗/斜体（** *，以及全角＊＊）、井号标题（#）、列表符号（- * 1.）、"
+    "代码块/反引号、链接语法、引用符（>）、表格。"
+    "用短句和换行分段即可。"
+)
+
+# CJK ideographs plus punctuation that must survive plain-text cleanup.
+_CJK = r"\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff"
+_CJK_PUNCT = (
+    r"\u3001\u3002\uff0c\uff01\uff1f\uff1b\uff1a"  # 、。，！？；：
+    r"\u201c\u201d\u2018\u2019"  # “”‘’
+    r"\uff08\uff09\u3010\u3011\u300a\u300b"  # （）【】《》
+    r"\u300c\u300d\u300e\u300f"  # 「」『』
+    r"\u2026\u2014\uff5e\u00b7"  # …—～·
+)
+_MARKER_EDGE = _CJK + _CJK_PUNCT + r"\(\)\[\]\{\}<>\"'“”‘’"
+
+
+def _merge_system_prompt(custom: str) -> str:
+    """Append the hard-coded plain-text ban. An empty prompt still gets the ban."""
+    text = (custom or "").strip()
+    if not text:
+        return NO_MARKDOWN_RULE
+    if NO_MARKDOWN_RULE in text:
+        return text
+    return f"{text}\n{NO_MARKDOWN_RULE}"
+
+
+def _extract_code(text: str) -> tuple[str, list[str]]:
+    """Pull fenced and inline code aside so exponents like 2**10 stay intact."""
+    held: list[str] = []
+
+    def _put(body: str) -> str:
+        held.append(body)
+        return f"\ue000{len(held) - 1}\ue001"
+
+    def _fence(match: re.Match[str]) -> str:
+        return _put(match.group(1).strip("\n"))
+
+    def _inline(match: re.Match[str]) -> str:
+        return _put(match.group(1))
+
+    text = re.sub(r"```[^\n]*\n([\s\S]*?)```", _fence, text)
+    text = re.sub(r"```[^\n]*\n([\s\S]*)$", _fence, text)
+    text = re.sub(r"`([^`\n]+)`", _inline, text)
+    text = re.sub(r"```[^\n]*", "", text)
+    text = text.replace("`", "").replace("\uff40", "")
+    return text, held
+
+
+def _restore_code(text: str, held: list[str]) -> str:
+    def _back(match: re.Match[str]) -> str:
+        idx = int(match.group(1))
+        if 0 <= idx < len(held):
+            return held[idx]
+        return ""
+
+    return re.sub(r"\ue000(\d+)\ue001", _back, text)
+
+
+def _strip_html(text: str) -> str:
+    # Tag name must follow < immediately. "a < b > c" is an inequality, not <b>.
+    text = re.sub(r"(?i)(?<![A-Za-z0-9])<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)(?<![A-Za-z0-9])</(?:p|div|li|tr|h[1-6])>", "\n", text)
+    text = re.sub(
+        r"(?i)(?<![A-Za-z0-9])</?(?:p|div|span|li|ul|ol|strong|b|em|i|code|pre|h[1-6]|table|thead|tbody|tr|td|th)\b[^<>]*>",
+        "",
+        text,
+    )
+    return (
+        text.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", '"')
+    )
+
+
+def _strip_links(text: str) -> str:
+    text = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\[[^\]]*\]", r"\1", text)
+    text = re.sub(r"<(https?://[^>\s]+)>", r"\1", text)
+    text = re.sub(r"\[\^[^\]]+\]", "", text)
+    text = re.sub(r"(?m)^[ \t]{0,3}\[[^\]]+\]:\s+\S+.*$", "", text)
+    return text
+
+
+def _plain_table_line(line: str) -> str:
+    raw = line.strip()
+    if raw.count("|") < 2:
+        return line
+    if not (raw.startswith("|") or raw.endswith("|")):
+        return line
+    core = raw[1:] if raw.startswith("|") else raw
+    if core.endswith("|"):
+        core = core[:-1]
+    cells = [cell.strip() for cell in core.split("|")]
+    if cells and all(re.fullmatch(r":?-{3,}:?", cell) or cell == "" for cell in cells):
+        return ""
+    return " ".join(cell for cell in cells if cell)
+
+
+def _strip_blocks(text: str) -> str:
+    # "# 标题" / "#标题", but not "#include" or a mid-line "C#".
+    text = re.sub(
+        r"(?m)^[ \t]{0,3}[#\uff03]{1,6}(?:[ \t]+|(?=[" + _CJK + r"]))",
+        "",
+        text,
+    )
+    for _ in range(3):
+        nxt = re.sub(r"(?m)^[ \t]{0,3}(?:>|\uff1e)[ \t]?", "", text)
+        if nxt == text:
+            break
+        text = nxt
+    text = re.sub(r"(?m)^[ \t]*([-*_]\s*){3,}[ \t]*$", "", text)
+    text = re.sub(r"(?m)^[ \t]*={3,}[ \t]*$", "", text)
+    lines = [_plain_table_line(line) for line in text.split("\n")]
+    text = "\n".join(lines)
+    # Markdown bullets may sit against CJK. Middle dot · is also a name separator, so
+    # it is a bullet only when whitespace follows (· 项目), not in ·乔治·奥威尔.
+    text = re.sub(
+        r"(?m)^[ \t]{0,3}(?:[-*+]|\uff0d|\uff0a)(?:[ \t]+|(?=[" + _CJK + r"]))",
+        "",
+        text,
+    )
+    text = re.sub(r"(?m)^[ \t]{0,3}[•●○▪∙►▶·・][ \t]+", "", text)
+    text = re.sub(
+        r"(?m)^[ \t]{0,3}[0-9\uff10-\uff19]{1,2}(?:[.．。)）][ \t]+|[.．。)）、](?=["
+        + _CJK
+        + r"A-Za-z（(]))",
+        "",
+        text,
+    )
+    text = re.sub(r"(?m)^[ \t]{0,3}\[[ xX]\][ \t]+", "", text)
+    return text
+
+
+def _strip_emphasis(text: str) -> str:
+    patterns = (
+        re.compile(r"(?<![A-Za-z0-9*])\*\*\*([^\n]+?)\*\*\*(?![A-Za-z0-9*])"),
+        re.compile(r"(?<![A-Za-z0-9_])___([^\n]+?)___(?![A-Za-z0-9_])"),
+        re.compile(r"(?<![A-Za-z0-9*])\*\*([^\n]+?)\*\*(?![A-Za-z0-9*])"),
+        re.compile(
+            r"(?<![A-Za-z0-9_])__(?!\s)([^\n_]*?[\u4e00-\u9fff\s][^\n_]*?)(?<!\s)__(?![A-Za-z0-9_])"
+        ),
+        re.compile(r"(?<![A-Za-z0-9*])\*(?!\s)([^\n]+?)(?<!\s)\*(?![A-Za-z0-9*])"),
+        re.compile(r"(?<![A-Za-z0-9_])_(?!\s)([^\n_]+?)(?<!\s)_(?![A-Za-z0-9_])"),
+        re.compile(r"~~([^\n]+?)~~"),
+    )
+    for _ in range(4):
+        prev = text
+        for pattern in patterns:
+            text = pattern.sub(lambda match: match.group(1).strip(), text)
+        if text == prev:
+            break
+    return text
+
+
+def _strip_leftover_markers(text: str) -> str:
+    """Drop unmatched emphasis left by Chinese models; keep 2**10 and __init__."""
+    # ** is emphasis unless both neighbors are ASCII (exponent / identifier).
+    text = re.sub(r"(?<![A-Za-z0-9])\*\*|\*\*(?![A-Za-z0-9])", "", text)
+    text = re.sub(r"(?<![A-Za-z0-9_])__(?![A-Za-z0-9_])", "", text)
+    text = re.sub(rf"__(?=[{_CJK}])", "", text)
+    text = re.sub(rf"(?<=[{_CJK}])__", "", text)
+    # Single markers at the edge of a CJK run (*重点 / 重点*). A star sandwiched
+    # between CJK (普通*号, 文件_名) is left alone.
+    text = re.sub(rf"(?<![{_CJK}A-Za-z0-9])[*_]+(?=[{_CJK}])", "", text)
+    text = re.sub(rf"(?<=[{_CJK}])[*_]+(?![{_CJK}A-Za-z0-9])", "", text)
+    text = re.sub(rf"(?<=[{_MARKER_EDGE}])\*+(?![{_CJK}A-Za-z0-9])", "", text)
+    text = re.sub(rf"(?<![{_CJK}A-Za-z0-9])\*+(?=[{_MARKER_EDGE}])", "", text)
+    text = text.replace("~~", "")
+    text = re.sub(r"(?m)^[ \t]*[*_~#\uff03]{1,3}[ \t]*$", "", text)
+    return text
+
+
 def markdown_to_plain(text: str) -> str:
-    """Strip common Markdown for watch / plain clients."""
+    """Strip Markdown, including leftovers common from Chinese LLMs.
+
+    Chinese punctuation（，。！？、；：""''（）【】《》—…～）is kept.
+    ASCII exponents (2**10) and identifier underscores (__init__, snake_case) are kept.
+    """
     if not text:
         return ""
-    s = text.replace("\r\n", "\n")
-    s = re.sub(r"```[^\n]*\n([\s\S]*?)```", r"\1", s)
-    s = re.sub(r"`([^`]+)`", r"\1", s)
-    s = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", s)
-    s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
-    s = re.sub(r"^#{1,6}\s*", "", s, flags=re.M)
-    s = re.sub(r"^\s{0,3}([-*+]|\d+\.)\s+", "", s, flags=re.M)
-    s = re.sub(r"^\s{0,3}>\s?", "", s, flags=re.M)
-    s = re.sub(r"(\*\*|__)(.+?)\1", r"\2", s)
-    s = re.sub(r"(\*|_)([^*_\n]+?)\1", r"\2", s)
-    s = re.sub(r"~~(.+?)~~", r"\1", s)
-    s = re.sub(r"^\s*([-*_]\s*){3,}\s*$", "", s, flags=re.M)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = normalized.replace("\uff0a", "*").replace("\uff3f", "_")
+    stripped, held = _extract_code(normalized)
+    stripped = _strip_html(stripped)
+    stripped = _strip_links(stripped)
+    stripped = _strip_blocks(stripped)
+    stripped = _strip_emphasis(stripped)
+    stripped = _strip_leftover_markers(stripped)
+    stripped = _restore_code(stripped, held)
+    stripped = "\n".join(line.rstrip() for line in stripped.split("\n"))
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped)
+    return stripped.strip()
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -55,7 +236,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "model": "DeepSeek-V4-Flash",
     "system_prompt": (
         "你是腕上 AI 助手，回答简洁，优先适合手表小屏阅读。"
-        "可聊天，也可讲解高中题目；解题先给结论，再给简短步骤。"
+        "可聊天，也可讲解高中题目；解题先给结论，再给简短步骤。\n"
+        + NO_MARKDOWN_RULE
     ),
     "max_tokens": 1600,
     "temperature": 0.7,
@@ -309,6 +491,7 @@ code{color:#c9e3ff;background:#121820;padding:1px 6px;border-radius:6px}
     <div class="kv" id="keyHint"></div>
     <label>系统提示词</label>
     <textarea id="systemPrompt"></textarea>
+    <div class="kv">向上游请求时会强制附上「纯文本、禁止 Markdown」规则，只改这里无法去掉。网页测试对话仍按 Markdown 渲染原文。</div>
     <div class="row">
       <div style="flex:1;min-width:120px">
         <label>max_tokens</label>
@@ -645,10 +828,13 @@ def bootstrap(request: Request) -> dict[str, Any]:
 
 
 def _build_messages(cfg: dict[str, Any], body: dict[str, Any]) -> list[dict[str, str]]:
-    messages: list[dict[str, str]] = []
-    system_prompt = str(cfg.get("system_prompt") or "").strip()
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
+    # The no-Markdown ban is merged in code, not taken only from the editable prompt.
+    messages: list[dict[str, str]] = [
+        {
+            "role": "system",
+            "content": _merge_system_prompt(str(cfg.get("system_prompt") or "")),
+        }
+    ]
 
     raw_messages = body.get("messages")
     if isinstance(raw_messages, list) and raw_messages:
@@ -657,8 +843,11 @@ def _build_messages(cfg: dict[str, Any], body: dict[str, Any]) -> list[dict[str,
                 continue
             role = str(m.get("role") or "").strip()
             content = str(m.get("content") or "").strip()
-            if role in {"user", "assistant", "system"} and content:
-                messages.append({"role": role, "content": content})
+            if role not in {"user", "assistant", "system"} or not content:
+                continue
+            if role == "system":
+                content = _merge_system_prompt(content)
+            messages.append({"role": role, "content": content})
     else:
         prompt = str(body.get("prompt") or body.get("message") or "").strip()
         if prompt:
